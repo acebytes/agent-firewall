@@ -1,0 +1,25 @@
+# Local run artifacts
+results/*
+!results/.gitkeep
+!results/_baselines/
+
+# API key — never committed
+.env
+.env.local
+
+# Docker build cache (local layering)
+.buildx-cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Go build output
+/out/
+*.test
+*.prof
+
+# Editors
+.vscode/
+.idea/
+*.swp

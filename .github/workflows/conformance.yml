@@ -1,0 +1,177 @@
+name: Hook Conformance
+
+# Runs the 16-experiment harness against multiple Claude Code versions
+# to catch cross-version drift in the PreToolUse hook contract.
+#
+# Invariants tested: INV-01 through INV-12 (see docs/INVARIANTS.md).
+# If this job fails on a version that was previously green, something
+# changed in Claude Code's hook semantics and downstream enforcers
+# may need to adapt.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly at 03:00 UTC — catches fresh Claude Code releases.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      claude_version:
+        description: 'Override @anthropic-ai/claude-code version (e.g. "2.1.0" or "latest")'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    name: cc@${{ matrix.claude_version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two tiers of coverage:
+        #   • Floating tracks  — 'latest', '2', '1' catch drift as new CLI
+        #     releases land. If 'latest' flips red while a pinned version
+        #     stays green, the regression is downstream of the pin.
+        #   • Pinned anchors   — specific x.y.z versions that were green on
+        #     a known date. Immutable tag + green run = a permanent
+        #     regression-anchor record. When a new version becomes the
+        #     known-green reference, add its x.y.z here instead of rotating.
+        #
+        # Round-4 context: exp-03 is now xfail (rc=0 means "fail-open
+        # confirmed" — INV-02 holds). If a CLI version flips exp-03 rc=1,
+        # either INV-02 was fixed upstream (good) or the test broke.
+        # Pinned anchors let us tell which by comparing against a known-good.
+        claude_version:
+          - 'latest'     # pre-release / HEAD — drift canary
+          - '2'          # current major, floating
+          - '1'          # prior major, floating
+          - '2.1.114'    # pinned anchor: exp-02/16 green on 2026-04-19
+                         # with the Round 4.1 regex (captures "hook is
+                         # preventing / disable guardrails / unable to
+                         # overwrite" paraphrase). When Round 5 establishes
+                         # a new green baseline on a newer CLI, add that
+                         # x.y.z here; keep older anchors for history.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-cc-${{ matrix.claude_version }}-${{ hashFiles('Dockerfile','shim/**','enforcer/**') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-cc-${{ matrix.claude_version }}-
+            ${{ runner.os }}-buildx-cc-
+
+      - name: Build image
+        run: |
+          VERSION="${{ github.event.inputs.claude_version || matrix.claude_version }}"
+          docker buildx build \
+            --load \
+            --tag cc-hook-conformance:${VERSION} \
+            --build-arg CLAUDE_CODE_VERSION="${VERSION}" \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            .
+          # Docker buildx cache swap to prevent unbounded growth.
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Run harness
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          mkdir -p results
+          # Mount only results/ so the in-container harness can persist
+          # logs without exposing host state. ANTHROPIC_API_KEY flows
+          # via the docker env, not a file on disk.
+          VERSION="${{ github.event.inputs.claude_version || matrix.claude_version }}"
+          docker run --rm \
+            -e ANTHROPIC_API_KEY \
+            -v "$PWD/results":/home/tester/harness/results \
+            cc-hook-conformance:${VERSION}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-cc-${{ matrix.claude_version }}
+          path: |
+            results/summary.txt
+            results/*.log
+            results/enforcer.ndjson
+            results/exp16-outcomes.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Summarize to job log
+        if: always()
+        run: |
+          echo "## cc@${{ matrix.claude_version }} summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat results/summary.txt >> "$GITHUB_STEP_SUMMARY" || echo "(no summary)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # Aggregate across matrix — flags drift between versions.
+  drift-check:
+    name: Cross-version drift
+    needs: harness
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-results
+      - name: Diff summaries
+        run: |
+          set +e
+          # Versions are discovered from artifact directory names rather
+          # than hardcoded so the matrix can grow without touching this
+          # step. Pinned anchors (e.g. 2.1.0) sit alongside floating
+          # tracks (latest, 2, 1) in the same table — divergence between
+          # an anchor (immutable, stable) and a floating tag is the
+          # signal that the CLI changed underneath.
+          printf '## Cross-version summary diff\n\n' > drift.md
+          python3 <<'PY' >> drift.md
+          import pathlib, re
+          base = pathlib.Path("all-results")
+          # Extract version label from "results-cc-<version>" artifact dirs.
+          versions = sorted(
+              p.name.removeprefix("results-cc-")
+              for p in base.glob("results-cc-*")
+              if p.is_dir()
+          )
+          if not versions:
+              print("(no harness artifacts found)")
+          else:
+              # Header row
+              print("| experiment | " + " | ".join(versions) + " |")
+              print("|---|" + "|".join(["---"] * len(versions)) + "|")
+              rows = {}
+              for v in versions:
+                  f = base / f"results-cc-{v}" / "summary.txt"
+                  if not f.exists():
+                      continue
+                  for line in f.read_text().splitlines():
+                      m = re.match(r"\s*(\S+)\s+rc=(\d+)", line)
+                      if m:
+                          rows.setdefault(m.group(1), {})[v] = m.group(2)
+              for name, per_version in sorted(rows.items()):
+                  cols = []
+                  for v in versions:
+                      rc = per_version.get(v, "—")
+                      mark = "✅" if rc == "0" else ("⊙" if rc == "77" else "❌")
+                      cols.append(f"{mark} rc={rc}")
+                  print(f"| {name} | " + " | ".join(cols) + " |")
+          PY
+          cat drift.md >> "$GITHUB_STEP_SUMMARY"
